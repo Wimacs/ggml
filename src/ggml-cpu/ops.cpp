@@ -7922,6 +7922,63 @@ void ggml_compute_forward_upscale(
     }
 }
 
+// ggml_compute_forward_pixel_shuffle_3d
+
+static void ggml_compute_forward_pixel_shuffle_3d_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t scale = ggml_get_op_params_i32(dst, 0);
+    const int64_t scale2 = scale * scale;
+    const int64_t scale3 = scale2 * scale;
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+    GGML_ASSERT(ne03 == ne3 * scale3);
+
+    for (int64_t i3 = 0; i3 < ne3; ++i3) {
+        for (int64_t i2 = ith; i2 < ne2; i2 += nth) {
+            const int64_t i02 = i2 / scale;
+            const int64_t r2 = i2 - i02 * scale;
+            for (int64_t i1 = 0; i1 < ne1; ++i1) {
+                const int64_t i01 = i1 / scale;
+                const int64_t r1 = i1 - i01 * scale;
+                for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                    const int64_t i00 = i0 / scale;
+                    const int64_t r0 = i0 - i00 * scale;
+                    const int64_t i03 = i3 * scale3 + r2 * scale2 + r1 * scale + r0;
+
+                    const float * x = (const float *) ((const char *) src0->data + i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03);
+                    float * y = (float *) ((char *) dst->data + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3);
+                    *y = *x;
+                }
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_pixel_shuffle_3d(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_pixel_shuffle_3d_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 
 // ggml_compute_forward_pad
 

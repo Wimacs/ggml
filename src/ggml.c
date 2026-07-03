@@ -1037,6 +1037,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "POOL_2D",
     "POOL_2D_BACK",
     "UPSCALE",
+    "PIXEL_SHUFFLE_3D",
     "PAD",
     "PAD_REFLECT_1D",
     "ROLL",
@@ -1078,7 +1079,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1148,6 +1149,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "pool_2d(x)",
     "pool_2d_back(x)",
     "upscale(x)",
+    "pixel_shuffle_3d(x)",
     "pad(x)",
     "pad_reflect_1d(x)",
     "roll(x)",
@@ -1189,7 +1191,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5049,6 +5051,33 @@ struct ggml_tensor * ggml_upscale(
         enum ggml_scale_mode  mode) {
     GGML_ASSERT(scale_factor > 1);
     return ggml_interpolate_impl(ctx, a, a->ne[0] * scale_factor, a->ne[1] * scale_factor, a->ne[2], a->ne[3], mode);
+}
+
+struct ggml_tensor * ggml_pixel_shuffle_3d(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   scale_factor) {
+    GGML_ASSERT(scale_factor > 1);
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+
+    const int64_t s = scale_factor;
+    const int64_t s3 = s * s * s;
+    GGML_ASSERT(a->ne[3] % s3 == 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(
+        ctx,
+        a->type,
+        a->ne[0] * s,
+        a->ne[1] * s,
+        a->ne[2] * s,
+        a->ne[3] / s3);
+
+    ggml_set_op_params_i32(result, 0, scale_factor);
+
+    result->op     = GGML_OP_PIXEL_SHUFFLE_3D;
+    result->src[0] = a;
+
+    return result;
 }
 
 struct ggml_tensor * ggml_upscale_ext(

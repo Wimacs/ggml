@@ -544,6 +544,7 @@ extern "C" {
         GGML_OP_POOL_2D,
         GGML_OP_POOL_2D_BACK,
         GGML_OP_UPSCALE,
+        GGML_OP_PIXEL_SHUFFLE_3D,
         GGML_OP_PAD,
         GGML_OP_PAD_REFLECT_1D,
         GGML_OP_ROLL,
@@ -2253,6 +2254,14 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   scale_factor,
             enum ggml_scale_mode  mode);
+
+    // 3D pixel shuffle / depth-to-space.
+    // input:  [W, H, D, C * scale_factor^3]
+    // output: [W * scale_factor, H * scale_factor, D * scale_factor, C]
+    GGML_API struct ggml_tensor * ggml_pixel_shuffle_3d(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   scale_factor);
 
     // interpolate
     // interpolate scale to specified dimensions
