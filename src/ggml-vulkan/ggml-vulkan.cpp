@@ -816,6 +816,7 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_concat_i8, pipeline_concat_i16, pipeline_concat_i32, pipeline_concat_i64;
     vk_pipeline pipeline_upscale_nearest_f32, pipeline_upscale_bilinear_f32, pipeline_upscale_bicubic_f32, pipeline_upscale_bilinear_antialias_f32;
+    vk_pipeline pipeline_pixel_shuffle_3d_f32;
     vk_pipeline pipeline_scale_f32;
     vk_pipeline pipeline_log[2];
     vk_pipeline pipeline_tri[2];
@@ -5090,6 +5091,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_upscale_bilinear_f32, "upscale_f32", upscale_f32_len, upscale_f32_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_BILINEAR}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_upscale_bicubic_f32, "upscale_f32", upscale_f32_len, upscale_f32_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_BICUBIC}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_upscale_bilinear_antialias_f32, "upscale_f32", upscale_f32_len, upscale_f32_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ANTIALIAS}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_pixel_shuffle_3d_f32, "pixel_shuffle_3d_f32", pixel_shuffle_3d_f32_len, pixel_shuffle_3d_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_scale_f32, "scale_f32", scale_f32_len, scale_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
@@ -10522,6 +10524,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             }
         }
         return nullptr;
+    case GGML_OP_PIXEL_SHUFFLE_3D:
+        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_pixel_shuffle_3d_f32;
+        }
+        return nullptr;
     case GGML_OP_SCALE:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_scale_f32;
@@ -11436,6 +11443,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     case GGML_OP_ARANGE:
     case GGML_OP_FILL:
     case GGML_OP_SCALE:
+    case GGML_OP_PIXEL_SHUFFLE_3D:
     case GGML_OP_SQR:
     case GGML_OP_SQRT:
     case GGML_OP_SIN:
@@ -12135,6 +12143,12 @@ static void ggml_vk_scale(ggml_backend_vk_context * ctx, vk_context& subctx, con
     p.param2 = ggml_get_op_params_f32(dst, 1);
 
     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_SCALE, std::move(p));
+}
+
+static void ggml_vk_pixel_shuffle_3d(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+    vk_op_unary_push_constants p = vk_op_unary_push_constants_init(src0, dst, ggml_nelements(dst));
+
+    ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_PIXEL_SHUFFLE_3D, std::move(p));
 }
 
 static void ggml_vk_sqr(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
@@ -14796,6 +14810,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
     case GGML_OP_CONV_3D:
         ggml_vk_conv_3d(ctx, compute_ctx, src0, src1, node);
+
+        break;
+    case GGML_OP_PIXEL_SHUFFLE_3D:
+        ggml_vk_pixel_shuffle_3d(ctx, compute_ctx, src0, node);
 
         break;
     case GGML_OP_CONV_2D_DW:
@@ -17574,6 +17592,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 ggml_is_contiguous(op->src[0]) &&
                 ggml_is_contiguous(op->src[1]) &&
                 ggml_is_contiguous(op);
+        case GGML_OP_PIXEL_SHUFFLE_3D:
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(op->src[0]) &&
+                ggml_is_contiguous(op);
         default:
             return false;
     }
@@ -18431,6 +18454,9 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             const int32_t N  = tensor->op_params[10];
             const int32_t OC = tensor->op_params[11];
             tensor_clone = ggml_conv_3d_direct(ggml_ctx, src_clone[0], src_clone[1], s0, s1, s2, p0, p1, p2, d0, d1, d2, IC, N, OC);
+        } else if (tensor->op == GGML_OP_PIXEL_SHUFFLE_3D) {
+            const int32_t scale = tensor->op_params[0];
+            tensor_clone = ggml_pixel_shuffle_3d(ggml_ctx, src_clone[0], scale);
         } else if (tensor->op == GGML_OP_CONV_2D_DW) {
             const int32_t s0 = tensor->op_params[0];
             const int32_t s1 = tensor->op_params[1];

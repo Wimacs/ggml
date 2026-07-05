@@ -1,0 +1,38 @@
+#version 450
+
+#include "types.glsl"
+#include "generic_unary_head.glsl"
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint idx = get_idx();
+
+    if (idx >= p.ne) {
+        return;
+    }
+
+    const uint scale = p.ne10 / p.ne00;
+    const uint scale2 = scale * scale;
+    const uint scale3 = scale2 * scale;
+
+    const uint i3 = idx / (p.ne12 * p.ne11 * p.ne10);
+    const uint rem3 = idx - i3 * p.ne12 * p.ne11 * p.ne10;
+    const uint i2 = rem3 / (p.ne11 * p.ne10);
+    const uint rem2 = rem3 - i2 * p.ne11 * p.ne10;
+    const uint i1 = rem2 / p.ne10;
+    const uint i0 = rem2 - i1 * p.ne10;
+
+    const uint i00 = i0 / scale;
+    const uint i01 = i1 / scale;
+    const uint i02 = i2 / scale;
+    const uint r0 = i0 - i00 * scale;
+    const uint r1 = i1 - i01 * scale;
+    const uint r2 = i2 - i02 * scale;
+    const uint i03 = i3 * scale3 + r2 * scale2 + r1 * scale + r0;
+
+    const uint src_idx = i03 * p.nb03 + i02 * p.nb02 + i01 * p.nb01 + i00 * p.nb00;
+    const uint dst_idx = i3 * p.nb13 + i2 * p.nb12 + i1 * p.nb11 + i0 * p.nb10;
+
+    data_d[get_doffset() + dst_idx] = D_TYPE(data_a[get_aoffset() + src_idx]);
+}
