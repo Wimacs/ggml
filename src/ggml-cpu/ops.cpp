@@ -7236,6 +7236,160 @@ void ggml_compute_forward_conv_transpose_2d(
     }
 }
 
+// ggml_compute_forward_conv_2d_deform
+
+static inline const char * ggml_tensor_data_at(
+        const ggml_tensor * t,
+        int64_t i0,
+        int64_t i1,
+        int64_t i2,
+        int64_t i3) {
+    return (const char *) t->data + i0*t->nb[0] + i1*t->nb[1] + i2*t->nb[2] + i3*t->nb[3];
+}
+
+static inline char * ggml_tensor_data_at(
+        ggml_tensor * t,
+        int64_t i0,
+        int64_t i1,
+        int64_t i2,
+        int64_t i3) {
+    return (char *) t->data + i0*t->nb[0] + i1*t->nb[1] + i2*t->nb[2] + i3*t->nb[3];
+}
+
+static inline float ggml_tensor_get_f32_4d(
+        const ggml_tensor * t,
+        int64_t i0,
+        int64_t i1,
+        int64_t i2,
+        int64_t i3) {
+    const char * ptr = ggml_tensor_data_at(t, i0, i1, i2, i3);
+    switch (t->type) {
+        case GGML_TYPE_F32: return *(const float *) ptr;
+        case GGML_TYPE_F16: return GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) ptr);
+        default: GGML_ABORT("conv_2d_deform: unsupported tensor type %d", t->type);
+    }
+}
+
+static inline void ggml_tensor_set_f32_4d(
+        ggml_tensor * t,
+        int64_t i0,
+        int64_t i1,
+        int64_t i2,
+        int64_t i3,
+        float v) {
+    char * ptr = ggml_tensor_data_at(t, i0, i1, i2, i3);
+    switch (t->type) {
+        case GGML_TYPE_F32:
+            *(float *) ptr = v;
+            break;
+        case GGML_TYPE_F16:
+            *(ggml_fp16_t *) ptr = GGML_CPU_FP32_TO_FP16(v);
+            break;
+        default:
+            GGML_ABORT("conv_2d_deform: unsupported tensor type %d", t->type);
+    }
+}
+
+static float ggml_conv_2d_deform_bilinear(
+        const ggml_tensor * input,
+        int64_t batch,
+        int64_t channel,
+        float x,
+        float y) {
+    const int64_t w = input->ne[0];
+    const int64_t h = input->ne[1];
+    const int64_t x0 = (int64_t) floorf(x);
+    const int64_t y0 = (int64_t) floorf(y);
+    const int64_t x1 = x0 + 1;
+    const int64_t y1 = y0 + 1;
+    const float dx = x - (float) x0;
+    const float dy = y - (float) y0;
+
+    float v00 = 0.0f;
+    float v01 = 0.0f;
+    float v10 = 0.0f;
+    float v11 = 0.0f;
+    if (x0 >= 0 && x0 < w && y0 >= 0 && y0 < h) {
+        v00 = ggml_tensor_get_f32_4d(input, x0, y0, channel, batch);
+    }
+    if (x1 >= 0 && x1 < w && y0 >= 0 && y0 < h) {
+        v01 = ggml_tensor_get_f32_4d(input, x1, y0, channel, batch);
+    }
+    if (x0 >= 0 && x0 < w && y1 >= 0 && y1 < h) {
+        v10 = ggml_tensor_get_f32_4d(input, x0, y1, channel, batch);
+    }
+    if (x1 >= 0 && x1 < w && y1 >= 0 && y1 < h) {
+        v11 = ggml_tensor_get_f32_4d(input, x1, y1, channel, batch);
+    }
+
+    const float v0 = v00 * (1.0f - dx) + v01 * dx;
+    const float v1 = v10 * (1.0f - dx) + v11 * dx;
+    return v0 * (1.0f - dy) + v1 * dy;
+}
+
+void ggml_compute_forward_conv_2d_deform(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * kernel = dst->src[0];
+    const ggml_tensor * input  = dst->src[1];
+    const ggml_tensor * offset = dst->src[2];
+    const ggml_tensor * mask   = dst->src[3];
+
+    GGML_ASSERT(input->type == GGML_TYPE_F32);
+    GGML_ASSERT(offset->type == GGML_TYPE_F32);
+    GGML_ASSERT(mask == nullptr || mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(kernel->type == GGML_TYPE_F32 || kernel->type == GGML_TYPE_F16);
+
+    const int32_t stride_x = dst->op_params[0];
+    const int32_t stride_y = dst->op_params[1];
+    const int32_t pad_x    = dst->op_params[2];
+    const int32_t pad_y    = dst->op_params[3];
+
+    const int64_t kw = kernel->ne[0];
+    const int64_t kh = kernel->ne[1];
+    const int64_t ic = kernel->ne[2];
+    const int64_t oc = kernel->ne[3];
+    const int64_t iw = input->ne[0];
+    const int64_t ih = input->ne[1];
+    const int64_t ow = dst->ne[0];
+    const int64_t oh = dst->ne[1];
+    const int64_t batch = dst->ne[3];
+    const int64_t total = batch * oc * oh * ow;
+
+    const int64_t per_thread = (total + params->nth - 1) / params->nth;
+    const int64_t begin = params->ith * per_thread;
+    const int64_t end = MIN(begin + per_thread, total);
+
+    for (int64_t index = begin; index < end; ++index) {
+        const int64_t x = index % ow;
+        const int64_t y = (index / ow) % oh;
+        const int64_t out_c = (index / (ow * oh)) % oc;
+        const int64_t b = index / (ow * oh * oc);
+
+        float acc = 0.0f;
+        for (int64_t ky = 0; ky < kh; ++ky) {
+            for (int64_t kx = 0; kx < kw; ++kx) {
+                const int64_t k = ky * kw + kx;
+                const float off_y = ggml_tensor_get_f32_4d(offset, x, y, 2*k + 0, b);
+                const float off_x = ggml_tensor_get_f32_4d(offset, x, y, 2*k + 1, b);
+                const float sx = (float) (x * stride_x + kx - pad_x) + off_x;
+                const float sy = (float) (y * stride_y + ky - pad_y) + off_y;
+                if (sx <= -1.0f || sx >= (float) iw || sy <= -1.0f || sy >= (float) ih) {
+                    continue;
+                }
+                const float m = mask == nullptr ? 1.0f : ggml_tensor_get_f32_4d(mask, x, y, k, b);
+                for (int64_t in_c = 0; in_c < ic; ++in_c) {
+                    const float v = ggml_conv_2d_deform_bilinear(input, b, in_c, sx, sy);
+                    const float w = ggml_tensor_get_f32_4d(kernel, kx, ky, in_c, out_c);
+                    acc += v * m * w;
+                }
+            }
+        }
+        ggml_tensor_set_f32_4d(dst, x, y, out_c, b, acc);
+    }
+}
+
 // ggml_compute_forward_conv_2d_dw
 
 struct ggml_conv_2d_dw_params {

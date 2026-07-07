@@ -1032,6 +1032,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "CONV_2D",
     "CONV_3D",
     "CONV_2D_DW",
+    "CONV_2D_DEFORM",
     "CONV_TRANSPOSE_2D",
     "POOL_1D",
     "POOL_2D",
@@ -1079,7 +1080,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1144,6 +1145,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "conv_2d(x)",
     "conv_3d(x)",
     "conv_2d_dw(x)",
+    "conv_2d_deform(x)",
     "conv_transpose_2d(x)",
     "pool_1d(x)",
     "pool_2d(x)",
@@ -1191,7 +1193,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -4844,6 +4846,65 @@ struct ggml_tensor * ggml_conv_2d_direct(
     result->op = GGML_OP_CONV_2D;
     result->src[0] = a;
     result->src[1] = b;
+
+    return result;
+}
+
+// ggml_conv_2d_deform
+
+struct ggml_tensor * ggml_conv_2d_deform(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * kernel, // convolution kernel [KW, KH, IC, OC]
+        struct ggml_tensor  * input,  // input data [W, H, IC, N]
+        struct ggml_tensor  * offset, // offsets [OW, OH, 2*KW*KH, N]
+        struct ggml_tensor  * mask,   // modulation mask [OW, OH, KW*KH, N], optional
+        int                   stride0,
+        int                   stride1,
+        int                   pad0,
+        int                   pad1) {
+
+    GGML_ASSERT(kernel->ne[2] == input->ne[2]);
+    GGML_ASSERT(kernel->type == GGML_TYPE_F32 || kernel->type == GGML_TYPE_F16);
+    GGML_ASSERT(input->type == GGML_TYPE_F32);
+    GGML_ASSERT(offset->type == GGML_TYPE_F32);
+    GGML_ASSERT(mask == NULL || mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(offset->ne[2] == 2 * kernel->ne[0] * kernel->ne[1]);
+    GGML_ASSERT(offset->ne[3] == input->ne[3]);
+    GGML_ASSERT(mask == NULL || mask->ne[2] == kernel->ne[0] * kernel->ne[1]);
+    GGML_ASSERT(mask == NULL || mask->ne[3] == input->ne[3]);
+
+    int64_t ne[4];
+    ne[0] = ggml_calc_conv_output_size(input->ne[0], kernel->ne[0], stride0, pad0, 1);
+    ne[1] = ggml_calc_conv_output_size(input->ne[1], kernel->ne[1], stride1, pad1, 1);
+    ne[2] = kernel->ne[3];
+    ne[3] = input->ne[3];
+
+    GGML_ASSERT(offset->ne[0] == ne[0] && offset->ne[1] == ne[1]);
+    GGML_ASSERT(mask == NULL || (mask->ne[0] == ne[0] && mask->ne[1] == ne[1]));
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, input->type, 4, ne);
+
+    if (!(ggml_is_contiguous(input) && ggml_is_contiguous(kernel))) {
+        GGML_ASSERT(ggml_is_contiguous_channels(input));
+        GGML_ASSERT(ggml_is_contiguous_channels(kernel));
+        GGML_ASSERT(ggml_is_contiguous_channels(offset));
+        GGML_ASSERT(mask == NULL || ggml_is_contiguous_channels(mask));
+        const int64_t type_size = ggml_type_size(result->type);
+        GGML_ASSERT(ggml_blck_size(result->type) == 1);
+        result->nb[0] = result->ne[2] * type_size;
+        result->nb[1] = result->ne[0] * result->nb[0];
+        result->nb[2] = type_size;
+        result->nb[3] = result->ne[1] * result->nb[1];
+    }
+
+    int32_t params[] = { stride0, stride1, pad0, pad1, 1, 1 };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_CONV_2D_DEFORM;
+    result->src[0] = kernel;
+    result->src[1] = input;
+    result->src[2] = offset;
+    result->src[3] = mask;
 
     return result;
 }

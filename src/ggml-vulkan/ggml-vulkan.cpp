@@ -939,6 +939,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f16_f32[CONV_SHAPE_COUNT];
+    std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_deform_f32[CONV_SHAPE_COUNT];
+    std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_deform_f16_f32[CONV_SHAPE_COUNT];
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv_transpose_2d_f32[CONV_SHAPE_COUNT];
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv_transpose_2d_f16_f32[CONV_SHAPE_COUNT];
     std::map<vk_conv3d_pipeline_state, vk_pipeline> pipeline_conv3d_f32[CONV_SHAPE_COUNT];
@@ -5497,7 +5499,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // cm1 needs a fixed subgroup width to match the WG_SIZE we computed
         const uint32_t conv2d_required_subgroup_size = conv2d_use_cm1 ? device->subgroup_size : 0;
 
-#define CREATE_CONV(name, type_suffix, spv_suffix) \
+#define CREATE_CONV(name, type_suffix, spv_suffix, n_sources) \
         for (auto &c : device->pipeline_##name##type_suffix[s]) { \
             const vk_conv2d_pipeline_state &state = c.first;  \
             std::vector<uint32_t> spec_constants_cpy = spec_constants; \
@@ -5515,14 +5517,16 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             spec_constants_cpy.push_back(conv2d_WN); \
             ggml_vk_create_pipeline( \
                 device, c.second, #name #type_suffix, \
-                name##type_suffix##spv_suffix##_len, name##type_suffix##spv_suffix##_data, "main", 3, \
+                name##type_suffix##spv_suffix##_len, name##type_suffix##spv_suffix##_data, "main", n_sources, \
                 sizeof(vk_op_conv2d_push_constants), wg_denoms, spec_constants_cpy, 1, true, use_collectives || conv2d_required_subgroup_size, conv2d_required_subgroup_size);    \
         }
 #define CREATE_CONVS(spv_suffix) \
-        CREATE_CONV(conv2d, _f32, spv_suffix) \
-        CREATE_CONV(conv2d, _f16_f32, spv_suffix) \
-        CREATE_CONV(conv_transpose_2d, _f32, spv_suffix) \
-        CREATE_CONV(conv_transpose_2d, _f16_f32, spv_suffix)
+        CREATE_CONV(conv2d, _f32, spv_suffix, 3) \
+        CREATE_CONV(conv2d, _f16_f32, spv_suffix, 3) \
+        CREATE_CONV(conv2d_deform, _f32, spv_suffix, 5) \
+        CREATE_CONV(conv2d_deform, _f16_f32, spv_suffix, 5) \
+        CREATE_CONV(conv_transpose_2d, _f32, spv_suffix, 3) \
+        CREATE_CONV(conv_transpose_2d, _f16_f32, spv_suffix, 3)
 #if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
         if (device->coopmat2) {
             CREATE_CONVS(_cm2)
@@ -10953,6 +10957,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
         return nullptr;
     case GGML_OP_CONV_2D:
+    case GGML_OP_CONV_2D_DEFORM:
     case GGML_OP_CONV_TRANSPOSE_2D:
         if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             uint32_t K = dst->ne[2]; // Cout
@@ -10988,12 +10993,21 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 } else if (src0->type == GGML_TYPE_F16) {
                     pipelines = &ctx->device->pipeline_conv2d_f16_f32[shape];
                 }
+            } else if (op == GGML_OP_CONV_2D_DEFORM) {
+                if (src0->type == GGML_TYPE_F32) {
+                    pipelines = &ctx->device->pipeline_conv2d_deform_f32[shape];
+                } else if (src0->type == GGML_TYPE_F16) {
+                    pipelines = &ctx->device->pipeline_conv2d_deform_f16_f32[shape];
+                }
             } else if (op == GGML_OP_CONV_TRANSPOSE_2D) {
                 if (src0->type == GGML_TYPE_F32) {
                     pipelines = &ctx->device->pipeline_conv_transpose_2d_f32[shape];
                 } else if (src0->type == GGML_TYPE_F16) {
                     pipelines = &ctx->device->pipeline_conv_transpose_2d_f16_f32[shape];
                 }
+            }
+            if (pipelines == nullptr) {
+                return nullptr;
             }
 
             vk_pipeline pipeline = nullptr;
@@ -11405,6 +11419,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             elements = { N * OC * OH * OW, 1, 1};
         } break;
     case GGML_OP_CONV_2D:
+    case GGML_OP_CONV_2D_DEFORM:
     case GGML_OP_CONV_TRANSPOSE_2D:
         if constexpr (std::is_same_v<PC, vk_op_conv2d_push_constants>) {
             const uint32_t NPQ = pc.N * pc.OH * pc.OW;
@@ -13355,7 +13370,11 @@ static void ggml_vk_conv_2d(ggml_backend_vk_context * ctx, vk_context & subctx, 
     p.nb2 = static_cast<uint32_t>(nb2 / nb0);
     p.nb3 = static_cast<uint32_t>(nb3 / nb0);
 
-    ggml_vk_op_f32(ctx, subctx, src0, src1, nullptr, nullptr, dst, dst->op, std::move(p));
+    if (dst->op == GGML_OP_CONV_2D_DEFORM) {
+        ggml_vk_op_f32(ctx, subctx, src0, src1, dst->src[2], dst->src[3], dst, dst->op, std::move(p));
+    } else {
+        ggml_vk_op_f32(ctx, subctx, src0, src1, nullptr, nullptr, dst, dst->op, std::move(p));
+    }
 }
 
 static void ggml_vk_conv_3d(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * src0,
@@ -14804,6 +14823,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_CONV_2D:
+    case GGML_OP_CONV_2D_DEFORM:
     case GGML_OP_CONV_TRANSPOSE_2D:
         ggml_vk_conv_2d(ctx, compute_ctx, src0, src1, node);
 
@@ -17575,15 +17595,26 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                    ggml_is_contiguous(op->src[0]) &&
                    ggml_is_contiguous(op);
         case GGML_OP_CONV_2D:
+        case GGML_OP_CONV_2D_DEFORM:
         case GGML_OP_CONV_TRANSPOSE_2D:
             {
                 // Channel-contiguous format is not supported yet.
-                return ((op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                bool ok = ((op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                     op->src[1]->type == GGML_TYPE_F32 &&
                     op->type == GGML_TYPE_F32 &&
                     ggml_is_contiguous(op->src[0]) &&
                     ggml_is_contiguous(op->src[1]) &&
                     ggml_is_contiguous(op));
+                if (op->op == GGML_OP_CONV_2D_DEFORM) {
+                    ok = ok &&
+                        op->src[2] != nullptr &&
+                        op->src[2]->type == GGML_TYPE_F32 &&
+                        ggml_is_contiguous(op->src[2]) &&
+                        op->src[3] != nullptr &&
+                        op->src[3]->type == GGML_TYPE_F32 &&
+                        ggml_is_contiguous(op->src[3]);
+                }
+                return ok;
             }
         case GGML_OP_CONV_3D:
             return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
@@ -18440,6 +18471,12 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             const int32_t d0 = tensor->op_params[4];
             const int32_t d1 = tensor->op_params[5];
             tensor_clone = ggml_conv_2d(ggml_ctx, src_clone[0], src_clone[1], s0, s1, p0, p1, d0, d1);
+        } else if (tensor->op == GGML_OP_CONV_2D_DEFORM) {
+            const int32_t s0 = tensor->op_params[0];
+            const int32_t s1 = tensor->op_params[1];
+            const int32_t p0 = tensor->op_params[2];
+            const int32_t p1 = tensor->op_params[3];
+            tensor_clone = ggml_conv_2d_deform(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3], s0, s1, p0, p1);
         } else if (tensor->op == GGML_OP_CONV_3D) {
             const int32_t s0 = tensor->op_params[0];
             const int32_t s1 = tensor->op_params[1];

@@ -101,8 +101,12 @@ if (CUDAToolkit_FOUND)
 
     file(GLOB   GGML_HEADERS_CUDA "*.cuh")
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
+    list(APPEND GGML_HEADERS_CUDA "conv2d-deform.cuh")
+    list(REMOVE_DUPLICATES GGML_HEADERS_CUDA)
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
+    list(APPEND GGML_SOURCES_CUDA "conv2d-deform.cu")
+    list(REMOVE_DUPLICATES GGML_SOURCES_CUDA)
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
