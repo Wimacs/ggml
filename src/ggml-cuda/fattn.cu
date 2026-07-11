@@ -451,7 +451,22 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
-    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    const bool has_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192;
+    const bool can_use_vector_kernel = has_vector_kernel && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    // The MMA/WMMA/tile kernels currently convert BF16 K/V to F16 before
+    // launch and use F16 VKQ accumulators.  Besides losing the BF16 exponent
+    // range, the latter can overflow for long diffusion-model sequences even
+    // when every input value is representable as F16.  On Ampere and newer
+    // NVIDIA GPUs the vector kernel consumes BF16 K/V directly and keeps QK,
+    // the online softmax, and VKQ in F32.  Prefer that correctness path for
+    // BF16 irrespective of the query count or KV-tail alignment.
+    const bool use_native_bf16_vector =
+        K->type == GGML_TYPE_BF16 && V->type == GGML_TYPE_BF16 &&
+        has_vector_kernel && cc >= GGML_CUDA_CC_AMPERE && GGML_CUDA_CC_IS_NVIDIA(cc);
+    if (use_native_bf16_vector) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
