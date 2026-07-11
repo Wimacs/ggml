@@ -100,7 +100,7 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 #define FA_TYPE_BF16 30u
 #define FA_TYPE_Q1_0 41u
 
-#if defined(BFLOAT16)
+#if defined(BFLOAT16) || defined(BF16_SOURCE_F16_MMA)
 #define O_TYPE float
 #define O_TYPEV4 vec4
 #else

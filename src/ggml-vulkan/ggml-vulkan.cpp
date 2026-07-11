@@ -3261,7 +3261,9 @@ struct vk_fa_tuning_params {
 };
 
 static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type);
-static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type = GGML_TYPE_F16);
+static bool ggml_vk_flash_attn_coopmat_shmem_support(
+    const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv,
+    bool f32acc, ggml_type k_type = GGML_TYPE_F16, bool bf16_source_f16_mma = false);
 
 static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
 
@@ -3397,14 +3399,34 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat2(const vk_device& device
     return result;
 }
 
+static bool ggml_vk_fa_use_bf16_source_f16_mma(
+        const vk_device& device, uint32_t hsk, uint32_t hsv, ggml_type k_type, ggml_type v_type) {
+    static const bool experiment_enabled = []() {
+        const char * value = getenv("GGML_VK_BF16_F16_MMA");
+        return value != nullptr && strcmp(value, "1") == 0;
+    }();
+
+    return experiment_enabled &&
+           device->vendor_id == VK_VENDOR_ID_NVIDIA &&
+           device->architecture != vk_device_architecture::NVIDIA_TURING &&
+           device->fp16 && device->coopmat1_fa_support &&
+           device->coopmat_support_16x16x16_f32acc &&
+           !device->coopmat_bf16_support && !device->coopmat2_bf16_support &&
+           hsk == 128 && hsv == 128 &&
+           k_type == GGML_TYPE_BF16 && v_type == GGML_TYPE_BF16;
+}
+
 static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
-    FaCodePath path = device->coopmat2 ? FA_COOPMAT2 :
+    const bool bf16_source_f16_mma = ggml_vk_fa_use_bf16_source_f16_mma(device, hsk, hsv, k_type, v_type);
+    FaCodePath path = bf16_source_f16_mma ? FA_COOPMAT1 :
+                      device->coopmat2 ? FA_COOPMAT2 :
                       device->coopmat1_fa_support ? FA_COOPMAT1 : FA_SCALAR;
 
     if (path == FA_COOPMAT2 && k_type == GGML_TYPE_BF16 && !device->coopmat2_bf16_support) {
         path = FA_COOPMAT1;
     }
-    if (path == FA_COOPMAT1 && k_type == GGML_TYPE_BF16 && !device->coopmat_bf16_support) {
+    if (path == FA_COOPMAT1 && k_type == GGML_TYPE_BF16 &&
+            !device->coopmat_bf16_support && !bf16_source_f16_mma) {
         path = FA_SCALAR;
     }
 
@@ -3417,7 +3439,8 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
         bool shape_ok = (f32acc && device->coopmat_support_16x16x16_f32acc) ||
                         (!f32acc && device->coopmat_support_16x16x16_f16acc);
         const vk_fa_tuning_params params = get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
-        bool shmem_ok = ggml_vk_flash_attn_coopmat_shmem_support(device, params, hsk, hsv, f32acc, k_type);
+        bool shmem_ok = ggml_vk_flash_attn_coopmat_shmem_support(
+            device, params, hsk, hsv, f32acc, k_type, bf16_source_f16_mma);
 
         if (!shape_ok || !shmem_ok) {
             path = FA_SCALAR;
@@ -4068,19 +4091,32 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const bool fa_ds = fa.first.subgroup_size == 0;
 
             const bool bf16_kv = fa.first.k_type == GGML_TYPE_BF16;
+            const bool bf16_source_f16_mma = ggml_vk_fa_use_bf16_source_f16_mma(
+                device, fa.first.HSK, fa.first.HSV, fa.first.k_type, fa.first.v_type);
 
             const void * spv_data;
             size_t spv_size;
             const char *name;
             if (bf16_kv) {
+                if (bf16_source_f16_mma) {
+                    static std::once_flag bf16_source_f16_mma_log_once;
+                    std::call_once(bf16_source_f16_mma_log_once, []() {
+                        GGML_LOG_INFO("ggml_vulkan: effective FlashAttention lowering: BF16 source -> per-16-channel-panel scaled F16 KHR cooperative matrix, F32 QK/PV accumulation\n");
+                    });
+                    spv_data = flash_attn_f32_f16_bf16_source_f16_mma_cm1_data;
+                    spv_size = flash_attn_f32_f16_bf16_source_f16_mma_cm1_len;
+                    name = aligned ? "flash_attn_f32_bf16_source_f16_mma_aligned_cm1" :
+                                     "flash_attn_f32_bf16_source_f16_mma_cm1";
+                } else {
 #if defined(VK_KHR_shader_bfloat16) && defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
-                if (!device->coopmat_bf16_support) continue;
-                spv_data = flash_attn_f32_f16_bf16_cm1_data;
-                spv_size = flash_attn_f32_f16_bf16_cm1_len;
-                name = aligned ? "flash_attn_f32_bf16_aligned_cm1" : "flash_attn_f32_bf16_cm1";
+                    if (!device->coopmat_bf16_support) continue;
+                    spv_data = flash_attn_f32_f16_bf16_cm1_data;
+                    spv_size = flash_attn_f32_f16_bf16_cm1_len;
+                    name = aligned ? "flash_attn_f32_bf16_aligned_cm1" : "flash_attn_f32_bf16_cm1";
 #else
-                continue;
+                    continue;
 #endif
+                }
             } else {
                 if (f32acc) { spv_data = flash_attn_f32_f16_cm1_data;        spv_size = flash_attn_f32_f16_cm1_len; }
                 else        { spv_data = flash_attn_f32_f16_f16acc_cm1_data; spv_size = flash_attn_f32_f16_f16acc_cm1_len; }
@@ -10039,7 +10075,9 @@ static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, con
     return supported;
 }
 
-static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type) {
+static bool ggml_vk_flash_attn_coopmat_shmem_support(
+        const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv,
+        bool f32acc, ggml_type k_type, bool bf16_source_f16_mma) {
     // Needs to be kept up to date on shader changes
     const uint32_t Br = params.block_rows;
     const uint32_t Bc = params.block_cols;
@@ -10055,6 +10093,7 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     const uint32_t f16vec4 = 8;
 
     const uint32_t tmpsh = (Bc / MatBc) * sizeof(float);
+    const uint32_t v_panel_shift = bf16_source_f16_mma ? (hsv_pad / 16) * sizeof(uint32_t) : 0;
 
     const uint32_t qstride = hsk_pad / 4 + 2;
     const uint32_t Qf = Br * qstride * f16vec4;
@@ -10076,7 +10115,7 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
 
     const uint32_t slope = Br * acctype;
 
-    const uint32_t total_size = tmpsh + Qf + Psh + sfsh + ksh + pvsh + slope;
+    const uint32_t total_size = tmpsh + v_panel_shift + Qf + Psh + sfsh + ksh + pvsh + slope;
     const bool supported = total_size <= device->properties.limits.maxComputeSharedMemorySize;
 
     VK_LOG_DEBUG("ggml_vk_flash_attn_coopmat_shmem_support(HSK=" << hsk << ", HSV=" << hsv << ", f32acc=" << f32acc << ", total_size=" << total_size << ", supported=" << supported);

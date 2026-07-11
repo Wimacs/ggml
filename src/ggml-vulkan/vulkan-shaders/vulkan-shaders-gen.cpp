@@ -710,6 +710,30 @@ void process_shaders() {
         true, true, false, false);
 #endif
 
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    // NVIDIA KHR cooperative matrices do not universally expose BF16 operands.
+    // This variant keeps BF16 K/V as the source format, stages them as F16, and
+    // uses F32 accumulators for both QK and PV. V is power-of-two scaled per
+    // 16-channel panel so finite BF16 values cannot overflow during staging.
+    const std::map<std::string, std::string> fa_bf16_source_f16_mma_dict = {
+        {"FLOAT_TYPE",   "float16_t"},
+        {"FLOAT_TYPEV2", "f16vec2"},
+        {"FLOAT_TYPEV4", "f16vec4"},
+        {"FLOAT_TYPE_MAX", "float16_t(65504.0)"},
+        {"ACC_TYPE",     "float"},
+        {"ACC_TYPEV2",   "vec2"},
+        {"ACC_TYPEV4",   "vec4"},
+        {"Q_TYPE",       "float"},
+        {"D_TYPE",       "float"},
+        {"D_TYPEV4",     "vec4"},
+        {"FLOAT16",      "1"},
+        {"COOPMAT",      "1"},
+        {"BF16_SOURCE_F16_MMA", "1"},
+    };
+    string_to_spv("flash_attn_f32_f16_bf16_source_f16_mma", "flash_attn_cm1.comp",
+        fa_bf16_source_f16_mma_dict, true, true, false, false);
+#endif
+
 #if defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
     string_to_spv("flash_attn_f32_f16_bf16", "flash_attn_cm2.comp",
         merge_maps(fa_bf16_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}}),

@@ -102,8 +102,16 @@ layout (binding = 1) readonly buffer K_PACKED_Q5_1_P32 { block_q5_1_packed32 dat
     return FLOAT_TYPE(BUF.data[a_offset + ib].d) * FLOAT_TYPEV4(v0.x, v0.y, v1.x, v1.y);          \
 }
 
+#if defined(BF16_SOURCE_F16_MMA)
+// The BF16-source/F16-coopmat path only uses this helper for K.  Clamp before
+// narrowing so an unexpected BF16 exponent cannot turn a finite logit into an
+// infinity. V has a per-KV-tile power-of-two scale in flash_attn_cm1.comp.
+#define FA_DEQUANT4_BF16(BUF) \
+    return FLOAT_TYPEV4(clamp(bf16_to_fp32(uvec4(BUF.data[(a_offset + ib) / 4])), vec4(-65504.0), vec4(65504.0)));
+#else
 #define FA_DEQUANT4_BF16(BUF) \
     return FLOAT_TYPEV4(bf16_to_fp32(uvec4(BUF.data[(a_offset + ib) / 4])));
+#endif
 
 FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
     if (binding_idx == BINDING_IDX_K) {

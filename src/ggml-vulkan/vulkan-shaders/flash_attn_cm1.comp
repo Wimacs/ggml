@@ -40,6 +40,12 @@ layout (binding = 2) readonly buffer VV4 {FLOAT_TYPEV4 data_vv4[];};
 layout (binding = 3) readonly buffer M {float16_t data_m[];};
 
 shared float tmpsh[row_split];
+#if defined(BF16_SOURCE_F16_MMA)
+// Power-of-two downshift for each 16-channel V panel in the current KV tile.
+// Explicit per-panel slots avoid shared atomics and keep an outlier in one
+// panel from reducing F16 precision in every output channel.
+shared uint32_t v_panel_shift[HSV_pad / 16];
+#endif
 
 const uint32_t qstride = HSK_pad / 4 + 2;
 shared FLOAT_TYPEV4 Qf[Br * qstride];
@@ -394,6 +400,66 @@ void main() {
         }
 
         if (SHMEM_STAGING != 0) {
+#if defined(BF16_SOURCE_F16_MMA)
+            // This experimental shader is selected only for BF16 V on NVIDIA
+            // KHR cooperative matrices. Each subgroup scans one 16-channel
+            // panel at a time across all Bc rows. The common scale==1 case is
+            // staged during this scan; only panels with a large BF16 exponent
+            // are reread and rewritten.
+            const uint32_t panel_vecs = Bc * 4;
+            [[unroll]] for (uint32_t panel = gl_SubgroupID;
+                            panel < HSV_pad / 16;
+                            panel += gl_NumSubgroups) {
+                uint32_t thread_absmax_bits = 0;
+                [[unroll]] for (uint32_t idx = gl_SubgroupInvocationID;
+                                idx < panel_vecs;
+                                idx += gl_SubgroupSize) {
+                    const uint32_t c = idx / 4;
+                    const uint32_t d = panel * 4 + idx % 4;
+                    u16vec4 raw = u16vec4(0);
+                    if ((!KV_bounds_check || j * Bc + c < KV) && d < HSV / 4) {
+                        const uint32_t elem = v_offset + (j * Bc + c) * v_stride + 4 * d;
+                        raw = v_packed_bf16.data[elem / 4];
+                    }
+
+                    const uvec4 abs_bits = uvec4(raw) & uvec4(0x7FFFu);
+                    thread_absmax_bits = max(thread_absmax_bits,
+                        max(max(abs_bits.x, abs_bits.y), max(abs_bits.z, abs_bits.w)));
+
+                    const vec4 vf = clamp(bf16_to_fp32(uvec4(raw)), vec4(-65504.0), vec4(65504.0));
+                    kvsh[c * kvsh_stride + d] = FLOAT_TYPEV4(vf);
+                }
+
+                const uint32_t panel_absmax_bits = subgroupMax(thread_absmax_bits);
+                if (gl_SubgroupInvocationID == 0) {
+                    // BF16 exponent bias is 127. Keep staged values at exponent
+                    // 14 or below, leaving headroom for F16 rounding.
+                    const uint32_t max_exp_bits = (panel_absmax_bits >> 7) & 0xFFu;
+                    v_panel_shift[panel] = max_exp_bits > 141u ? max_exp_bits - 141u : 0u;
+                }
+            }
+            barrier();
+
+            [[unroll]] for (uint32_t idx = 0; idx < Bc * HSV_pad / 4; idx += gl_WorkGroupSize.x) {
+                const uint32_t d = (idx + tid) % (HSV_pad / 4);
+                const uint32_t c = (idx + tid) / (HSV_pad / 4);
+                if ((idx + gl_WorkGroupSize.x <= Bc * HSV_pad / 4 || c < Bc) &&
+                        v_panel_shift[d / 4] != 0) {
+                    u16vec4 raw = u16vec4(0);
+                    if ((!KV_bounds_check || j * Bc + c < KV) && d < HSV / 4) {
+                        const uint32_t elem = v_offset + (j * Bc + c) * v_stride + 4 * d;
+                        raw = v_packed_bf16.data[elem / 4];
+                    }
+
+                    // shift is at most 255 - 141 = 114, so both 2^-shift
+                    // and 2^shift are normal finite F32 powers of two.
+                    const uint32_t v_shift = v_panel_shift[d / 4];
+                    const float v_scale = uintBitsToFloat((127u - v_shift) << 23);
+                    const vec4 vf = bf16_to_fp32(uvec4(raw)) * v_scale;
+                    kvsh[c * kvsh_stride + d] = FLOAT_TYPEV4(clamp(vf, vec4(-65504.0), vec4(65504.0)));
+                }
+            }
+#else
             [[unroll]] for (uint32_t idx = 0; idx < Bc * HSV_pad / 4; idx += gl_WorkGroupSize.x) {
                 uint32_t d = (idx + tid) % (HSV_pad / 4);
                 uint32_t c = (idx + tid) / (HSV_pad / 4);
@@ -416,6 +482,7 @@ void main() {
                     kvsh[c * kvsh_stride + d] = V_Tf;
                 }
             }
+#endif
         }
         barrier();
 
@@ -516,7 +583,17 @@ void main() {
 
                     if (hsv_col >= hsv_base && hsv_col < hsv_base + hsv_per_tile && hsv_col < HSV) {
                         const uint local_hsv = (hsv_col - hsv_base) / 4;
+#if defined(BF16_SOURCE_F16_MMA)
+                        // A consumer subgroup reads every 16-channel panel in
+                        // this HSV tile, so undo the scale for the panel that
+                        // contains the actual output channel, not the panel
+                        // associated with gl_SubgroupID.
+                        const uint32_t v_shift = v_panel_shift[hsv_col / 16];
+                        const float v_inv_scale = uintBitsToFloat((127u + v_shift) << 23);
+                        Of[r][d_local] += O_TYPE(v_inv_scale) * pvsh[row * osh_stride + local_hsv];
+#else
                         Of[r][d_local] += pvsh[row * osh_stride + local_hsv];
+#endif
                     }
                 }
             }
@@ -611,7 +688,7 @@ void main() {
         const uint d_local = d0 / threads_per_rowgroup;
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
             Of[r][d_local] *= O_TYPE(Lfrcp[r]);
-#if defined(FLOAT_TYPE_MAX)
+#if defined(FLOAT_TYPE_MAX) && !defined(BF16_SOURCE_F16_MMA)
             Of[r][d_local] = clamp(Of[r][d_local], -FLOAT_TYPE_MAX, FLOAT_TYPE_MAX);
 #endif
         }
