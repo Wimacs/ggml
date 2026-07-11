@@ -3401,12 +3401,17 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat2(const vk_device& device
 
 static bool ggml_vk_fa_use_bf16_source_f16_mma(
         const vk_device& device, uint32_t hsk, uint32_t hsv, ggml_type k_type, ggml_type v_type) {
-    static const bool experiment_enabled = []() {
+    static const bool lowering_enabled = []() {
         const char * value = getenv("GGML_VK_BF16_F16_MMA");
-        return value != nullptr && strcmp(value, "1") == 0;
+        // The lowering is guarded below by the exact device, cooperative-
+        // matrix, accumulator, dtype and head-size capabilities it needs.
+        // Keep an opt-out for backend diagnostics, but do not require every
+        // model CLI user to know about an implementation-detail environment
+        // variable in order to get the supported fast path.
+        return value == nullptr || strcmp(value, "0") != 0;
     }();
 
-    return experiment_enabled &&
+    return lowering_enabled &&
            device->vendor_id == VK_VENDOR_ID_NVIDIA &&
            device->architecture != vk_device_architecture::NVIDIA_TURING &&
            device->fp16 && device->coopmat1_fa_support &&
