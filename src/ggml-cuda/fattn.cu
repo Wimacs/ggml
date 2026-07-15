@@ -355,6 +355,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
+    float logit_softcap = 0.0f;
+    memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+
     // The effective batch size for the kernel can be increased by gqa_ratio.
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
     bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
@@ -454,6 +457,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const bool has_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192;
     const bool can_use_vector_kernel = has_vector_kernel && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
+    const bool bf16_kv = K->type == GGML_TYPE_BF16 && V->type == GGML_TYPE_BF16;
+    // No CUDA FlashAttention kernel currently has a D=64 softcap specialization.
+    // Report it as unsupported so the scheduler can use a fallback backend.
+    if (bf16_kv && Q->ne[0] == 64 && logit_softcap != 0.0f) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+
     // The MMA/WMMA/tile kernels currently convert BF16 K/V to F16 before
     // launch and use F16 VKQ accumulators.  Besides losing the BF16 exponent
     // range, the latter can overflow for long diffusion-model sequences even
@@ -462,7 +472,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // the online softmax, and VKQ in F32.  Prefer that correctness path for
     // BF16 irrespective of the query count or KV-tail alignment.
     const bool use_native_bf16_vector =
-        K->type == GGML_TYPE_BF16 && V->type == GGML_TYPE_BF16 &&
+        bf16_kv &&
         has_vector_kernel && cc >= GGML_CUDA_CC_AMPERE && GGML_CUDA_CC_IS_NVIDIA(cc);
     if (use_native_bf16_vector) {
         return BEST_FATTN_KERNEL_VEC;
